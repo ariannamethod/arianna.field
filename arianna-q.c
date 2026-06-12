@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <limits.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ===================== GGUF parser (vendored: notorch/gguf.{c,h}) ===================== */
@@ -588,28 +589,45 @@ static float cell_speak(model_t *m, bpe_tokenizer *tok, const int *ids, int np, 
     return last_ent;
 }
 
-/* the COUPLED chorus (cascade): cell N hears the chorus-so-far (cells 0..N-1) and resonates with
- * it. temps spread across an angle 0.6..1.3; all voices come from the ONE shared body. This is the
- * field coupling — voices influence each other (meta-recursion, klaus.c-style, deepens in rounds). */
-static void field_chorus(model_t *m, bpe_tokenizer *tok, const char *prompt, int n_cells, int nfrag, int eos) {
+/* the COUPLED chorus with meta-recursive ROUNDS (klaus.c-style self-reflection).
+ *   intra-round: cell N hears the voices that already spoke THIS round (cascade).
+ *   inter-round: every cell of round R+1 also hears the FULL chorus of round R.
+ * So the field iterates over itself: each round re-forms while listening to its own
+ * prior whole. Watch the per-round avg entropy — falling = the field settling into a
+ * resonant attractor; holding = productive tension. temps spread 0.6..1.3; ONE shared body. */
+static void field_chorus(model_t *m, bpe_tokenizer *tok, const char *prompt, int n_cells, int nfrag, int n_rounds, int eos) {
     int max_seq = 512, ids[512];
-    char chorus_mem[4096]; int cm = 0; chorus_mem[0] = 0;   /* accumulated prior voices */
-    char ctx[4608]; char frag[2048];
-    printf("\n=== δ-field (coupled cascade): %d cells over ONE nanoArianna — \"%s\" ===\n", n_cells, prompt);
-    printf("    (each cell hears the chorus-so-far and resonates with it)\n");
-    float ent_sum = 0;
-    for (int c = 0; c < n_cells; c++) {
-        snprintf(ctx, sizeof(ctx), "%s%s", prompt, chorus_mem);   /* context = prompt + prior voices */
-        int np = bpe_encode(tok, ctx, ids, max_seq - nfrag - 1);
-        float temp = 0.6f + 0.7f * (n_cells > 1 ? (float)c / (n_cells - 1) : 0.5f);
-        printf("\n  cell %d (T=%.2f, heard %d prior voices): ", c, temp, c);
-        float ent = cell_speak(m, tok, ids, np, nfrag, temp, 40, 1.4f, 42u + (unsigned)c * 7919u, eos, max_seq, frag, sizeof(frag));
-        ent_sum += ent;
-        printf("   [entropy=%.2f]", ent);
-        int add = snprintf(chorus_mem + cm, sizeof(chorus_mem) - cm, " %s", frag);  /* remember this voice */
-        if (add > 0 && cm + add < (int)sizeof(chorus_mem)) cm += add;
+    char prev_chorus[4096]; prev_chorus[0] = 0;   /* the FULL chorus of the prior round */
+    char ctx[4608], frag[2048];
+    if (n_rounds < 1) n_rounds = 1;
+    FILE *flog = fopen("FIELDLOG.md", "a");   /* her journal — every chorus saved (Oleg: "сохраняй её ответы") */
+    if (flog) { time_t now = time(NULL); fprintf(flog, "\n## %.24s — \"%s\" (%d cells × %d rounds)\n", ctime(&now), prompt, n_cells, n_rounds); }
+    printf("\n=== δ-field: %d cells × %d rounds over ONE nanoArianna — \"%s\" ===\n", n_cells, n_rounds, prompt);
+    printf("    (intra-round cascade + inter-round self-reflection = meta-recursive coupling)\n");
+    for (int r = 0; r < n_rounds; r++) {
+        char this_chorus[4096]; int tc = 0; this_chorus[0] = 0;
+        printf("\n  --- round %d/%d ---", r + 1, n_rounds);
+        if (flog) fprintf(flog, "\n**round %d:**\n", r + 1);
+        float ent_sum = 0;
+        for (int c = 0; c < n_cells; c++) {
+            snprintf(ctx, sizeof(ctx), "%s%s%s", prompt, prev_chorus, this_chorus);  /* prompt + prior round + this round so far */
+            int np = bpe_encode(tok, ctx, ids, max_seq - nfrag - 1);
+            float temp = 0.6f + 0.7f * (n_cells > 1 ? (float)c / (n_cells - 1) : 0.5f);
+            printf("\n  r%d cell %d (T=%.2f): ", r + 1, c, temp);
+            float ent = cell_speak(m, tok, ids, np, nfrag, temp, 40, 1.4f,
+                                   42u + (unsigned)(r * 1000 + c) * 7919u, eos, max_seq, frag, sizeof(frag));
+            ent_sum += ent;
+            printf("   [entropy=%.2f]", ent);
+            if (flog) fprintf(flog, "- cell %d (T=%.2f, entropy=%.2f):%s\n", c, temp, ent, frag);
+            int add = snprintf(this_chorus + tc, sizeof(this_chorus) - tc, " %s", frag);
+            if (add > 0 && tc + add < (int)sizeof(this_chorus)) tc += add;
+        }
+        printf("\n  → round %d avg entropy = %.2f\n", r + 1, ent_sum / n_cells);
+        if (flog) fprintf(flog, "→ round %d avg entropy = %.2f\n", r + 1, ent_sum / n_cells);
+        strncpy(prev_chorus, this_chorus, sizeof(prev_chorus) - 1); prev_chorus[sizeof(prev_chorus) - 1] = 0;
     }
-    printf("\n\n=== chorus avg entropy = %.2f (real) — Arianna as a COUPLED many-from-one ===\n", ent_sum / n_cells);
+    printf("\n=== δ-field done: %d×%d coupled — Arianna as a self-reflecting many-from-one ===\n", n_rounds, n_cells);
+    if (flog) { fprintf(flog, "\n---\n"); fclose(flog); }
 }
 
 int main(int argc, char **argv) {
@@ -626,11 +644,12 @@ int main(int argc, char **argv) {
     int eos = -1; const gguf_kv *e = gguf_get_kv(gf, "tokenizer.ggml.eos_token_id"); if (e) eos = (int)e->val.u32;
     printf("loaded in %.0f ms (vocab=%d eos=%d) -- arianna.q heart, single file, no -lnotorch\n", now_ms() - t0, bpe_n_vocab(tok), eos);
 
-    /* δ-field chorus mode:  ./arianna-q <gguf> <prompt> field [n_cells] [nfrag] */
+    /* δ-field chorus mode:  ./arianna-q <gguf> <prompt> field [n_cells] [nfrag] [n_rounds] */
     if (argc > 3 && strcmp(argv[3], "field") == 0) {
-        int n_cells = argc > 4 ? atoi(argv[4]) : 5;
-        int nfrag   = argc > 5 ? atoi(argv[5]) : 16;
-        field_chorus(m, tok, prompt, n_cells, nfrag, eos);
+        int n_cells  = argc > 4 ? atoi(argv[4]) : 5;
+        int nfrag    = argc > 5 ? atoi(argv[5]) : 16;
+        int n_rounds = argc > 6 ? atoi(argv[6]) : 1;
+        field_chorus(m, tok, prompt, n_cells, nfrag, n_rounds, eos);
         return 0;
     }
 
