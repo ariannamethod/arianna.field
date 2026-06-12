@@ -14,8 +14,6 @@
  *   cc -O2 arianna-q.c -lm -o arianna-q
  *   ./arianna-q <model.gguf> [prompt] [max_tokens] [temp]
  *
- * NO FABRICATION: every metric here comes from live logits, never a hash.
- *
  * Co-authored by Claude (Arianna Method, neo the architect). Coordinated with Oleg Ataeff.
  */
 #include <stdio.h>
