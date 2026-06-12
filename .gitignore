@@ -1,3 +1,5 @@
 weights/
 *.gguf
 *.bin
+FIELDLOG.md
+arianna-q
