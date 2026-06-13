@@ -571,6 +571,10 @@ static int g_chorus = 1;       /* 1 = CHORUS (each cell answers the SAME prompt 
  * tokens — it can say the same meaning in its OWN words. g_round_tok = the chorus's emitted tokens this round. */
 static int   g_round_tok[1024]; static int g_round_tokn = 0;
 static float g_xrep = 1.3f;     /* >1 = penalise tokens neighbours already said (1 = off) */
+/* δ-life (Game of Life): cells born/die/reproduce by REAL-metric fitness. Increment 0 = MEASURE fitness inputs
+ * (theme/distinct/ent per cell) to FIELDLOG, act on nothing → calibrate thresholds before the population breathes. */
+static float g_cell_ent[8];     /* per-cell raw entropy this round (fitness input) */
+static int   g_life_on = 0;     /* 1 = measure/run the Game of Life. 0 = chorus byte-identical */
 
 static void forward(model_t *m, kv_cache *kv, int token, int pos, float *logits) {
     int E = m->embed, H = m->n_heads, KV = m->n_kv_heads, HD = m->head_dim;
@@ -863,6 +867,7 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
                                (out_disso && c < 8) ? g_commit[c] : NULL,
                                g_xcell > 0 ? &cur_kv : NULL, g_xcell > 0 ? &cur_len : NULL);
         if (out_disso && c < 8) g_commit_n[c] = cell_n;
+        if (c < 8) g_cell_ent[c] = ent;   /* δ-life: capture per-cell entropy (fitness input) */
         ent_sum += ent;
         for (int i = 0; i < cell_n; i++) if (cell_ids[i] >= 0 && cell_ids[i] < m->vocab) hist[cell_ids[i]]++;
         if (cent) {                                  /* this cell's fragment centroid in embedding space */
@@ -893,7 +898,22 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
         for (int a = 0; a < n_cells; a++) for (int b = a + 1; b < n_cells; b++) {
             dsum += 1.0 - vec_cosine(cent + (size_t)a * m->embed, cent + (size_t)b * m->embed, m->embed); dn++;
         }
-        *out_disso = dn ? (float)(dsum / dn) : 0.0f; free(cent);
+        *out_disso = dn ? (float)(dsum / dn) : 0.0f;
+        if (g_life_on && flog) {   /* δ-life INCREMENT 0: measure fitness inputs per cell, ACT ON NOTHING (calibration) */
+            float *F = (float*)calloc(m->embed, sizeof(float));
+            for (int a = 0; a < n_cells; a++) { const float *ca = cent + (size_t)a*m->embed; for (int d = 0; d < m->embed; d++) F[d] += ca[d]; }
+            if (n_cells) for (int d = 0; d < m->embed; d++) F[d] /= n_cells;
+            for (int a = 0; a < n_cells; a++) {
+                const float *ca = cent + (size_t)a*m->embed;
+                double nrm = 0; for (int d = 0; d < m->embed; d++) nrm += (double)ca[d]*ca[d];
+                float theme = vec_cosine(ca, F, m->embed);
+                float nn = -1.0f; for (int b = 0; b < n_cells; b++) if (b != a) { float cc = vec_cosine(ca, cent + (size_t)b*m->embed, m->embed); if (cc > nn) nn = cc; }
+                fprintf(flog, "  δ-life cell %d: theme_cos=%.3f nn_cos=%.3f distinct=%.3f ent=%.2f silent=%d\n",
+                        a, theme, nn, nn < 0 ? 1.0f : 1.0f - nn, a < 8 ? g_cell_ent[a] : 0.0f, nrm < 1e-9 ? 1 : 0);
+            }
+            free(F);
+        }
+        free(cent);
         g_dmean = commit_disagreement(n_cells, nfrag);   /* order-sensitive per-position disagreement (the lever's fuel) */
         for (int c = 0; c < n_cells && c < 8; c++) {      /* carry this round → next round's leap */
             strncpy(g_round_frag[c], cur_frag[c], 1023); g_round_frag[c][1023] = 0;
@@ -1032,6 +1052,7 @@ int main(int argc, char **argv) {
         g_xcell      = argc > 9 ? (float)atof(argv[9]) : 0.3f;   /* DEFAULT ALIVE: λ=0.3 balanced cross-cell. 0 = off */
         g_chorus     = argc > 10 ? atoi(argv[10]) : 1;           /* DEFAULT: 1 = chorus (each cell own answer). 0 = relay */
         g_xrep       = argc > 11 ? (float)atof(argv[11]) : 1.3f; /* cross-cell rep-penalty: don't echo neighbours' words (1=off) */
+        g_life_on    = argc > 12 ? atoi(argv[12]) : 0;           /* δ-life: 1 = measure/run Game of Life (incr.0 = log fitness inputs) */
         if (n_cells <= 0) {   /* auto: the field sizes itself from the prompt's entropy */
             float pe = probe_entropy(m, tok, prompt);
             n_cells = (int)(pe + 0.5f); if (n_cells < 1) n_cells = 1; if (n_cells > 8) n_cells = 8;
