@@ -565,6 +565,8 @@ static kv_cache *kv_new(int nl, int max_seq, int kv_dim) {
 static float g_xcell = 0.0f;   /* cross-cell neighbour-channel weight λ (0 = off): balanced own-ctx + λ·neighbour */
 static const kv_cache *g_nbr = NULL;
 static int g_nbr_len = 0;
+static int g_chorus = 1;       /* 1 = CHORUS (each cell answers the SAME prompt from its own angle, neighbour-aware
+                                * via cross-cell, NOT text); 0 = legacy RELAY (cascade continuation). Default chorus. */
 
 static void forward(model_t *m, kv_cache *kv, int token, int pos, float *logits) {
     int E = m->embed, H = m->n_heads, KV = m->n_kv_heads, HD = m->head_dim;
@@ -826,7 +828,8 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
     char cur_frag[8][1024];   /* this round's per-cell fragments → cached to g_round_frag for next round's leap */
     kv_cache *prev_kv = NULL; int prev_len = 0;   /* cross-cell: the prior cell's KV, attended by the next cell */
     for (int c = 0; c < n_cells; c++) {
-        if (g_leap_mode && r > 0) {                  /* dissonance-into-forward: route the cell by the prior round's split */
+        if (g_chorus) snprintf(ctx, sizeof(ctx), "%s", prompt);   /* CHORUS: each cell answers the SAME prompt from its own angle; awareness via cross-cell, not text */
+        else if (g_leap_mode && r > 0) {             /* RELAY (legacy): dissonance-into-forward route */
             g_leap_total++;
             if (g_dpeak >= THETA_HI) {
                 int dis = (g_leap_mode == 3) ? modal_cell(n_cells) : dissenter_cell(n_cells); g_leap_flips++;  /* leap=3 null: consensus last */
@@ -1018,6 +1021,7 @@ int main(int argc, char **argv) {
         float alpha  = argc > 7 ? (float)atof(argv[7]) : 0.0f;   /* soma coupling strength (0 = text-only baseline) */
         g_leap_mode  = argc > 8 ? atoi(argv[8]) : 2;             /* DEFAULT ALIVE: leap-v2 (dissenter-last). 0 = baseline */
         g_xcell      = argc > 9 ? (float)atof(argv[9]) : 0.3f;   /* DEFAULT ALIVE: λ=0.3 balanced cross-cell. 0 = off */
+        g_chorus     = argc > 10 ? atoi(argv[10]) : 1;           /* DEFAULT: 1 = chorus (each cell own answer). 0 = relay */
         if (n_cells <= 0) {   /* auto: the field sizes itself from the prompt's entropy */
             float pe = probe_entropy(m, tok, prompt);
             n_cells = (int)(pe + 0.5f); if (n_cells < 1) n_cells = 1; if (n_cells > 8) n_cells = 8;
