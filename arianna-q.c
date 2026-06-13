@@ -567,6 +567,10 @@ static const kv_cache *g_nbr = NULL;
 static int g_nbr_len = 0;
 static int g_chorus = 1;       /* 1 = CHORUS (each cell answers the SAME prompt from its own angle, neighbour-aware
                                 * via cross-cell, NOT text); 0 = legacy RELAY (cascade continuation). Default chorus. */
+/* cross-cell repetition penalty: a cell hears neighbours (cross-cell K/V) but must not LITERALLY echo their
+ * tokens — it can say the same meaning in its OWN words. g_round_tok = the chorus's emitted tokens this round. */
+static int   g_round_tok[1024]; static int g_round_tokn = 0;
+static float g_xrep = 1.3f;     /* >1 = penalise tokens neighbours already said (1 = off) */
 
 static void forward(model_t *m, kv_cache *kv, int token, int pos, float *logits) {
     int E = m->embed, H = m->n_heads, KV = m->n_kv_heads, HD = m->head_dim;
@@ -759,12 +763,16 @@ static float cell_speak(model_t *m, bpe_tokenizer *tok, const int *ids, int np, 
             matvec(fproj, m->tok_emb, g_field_dir, m->vocab, m->embed);
             for (int i = 0; i < m->vocab; i++) logits[i] += g_field_alpha * fproj[i];
         }
+        if (g_chorus && g_xrep > 1.0f) for (int i = 0; i < g_round_tokn; i++) {   /* cross-cell: don't literally echo neighbours' words */
+            int id = g_round_tok[i]; if (id >= 0 && id < m->vocab) logits[id] = logits[id] > 0 ? logits[id]/g_xrep : logits[id]*g_xrep;
+        }
         int next = sample2(logits, m->vocab, temp, top_k, rep, hist, hlen);
         if (next == eos) break;
         int bl = bpe_decode_token(tok, next, buf, sizeof(buf));
         if (verbose) { printf("%s", buf); fflush(stdout); }
         if (frag && fl + bl < frag_cap) { memcpy(frag + fl, buf, bl); fl += bl; }
         if (hlen < 256) hist[hlen++] = next;
+        if (g_chorus && g_xrep > 1.0f && g_round_tokn < 1024) g_round_tok[g_round_tokn++] = next;   /* feed the chorus's shared word-memory */
         if (g_field_on) {                             /* the chorus updates the shared field (EMA) */
             const float *e = m->tok_emb + (long)next * m->embed;
             for (int i = 0; i < m->embed && i < 8192; i++) g_field_dir[i] = g_field_dir[i]*0.92f + e[i]*0.08f;
@@ -827,6 +835,7 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
     float *cent = out_disso ? (float*)calloc((size_t)n_cells * m->embed, sizeof(float)) : NULL;  /* per-cell fragment centroids → D_R */
     char cur_frag[8][1024];   /* this round's per-cell fragments → cached to g_round_frag for next round's leap */
     kv_cache *prev_kv = NULL; int prev_len = 0;   /* cross-cell: the prior cell's KV, attended by the next cell */
+    g_round_tokn = 0;   /* fresh shared word-memory for this round's cross-cell rep-penalty */
     for (int c = 0; c < n_cells; c++) {
         if (g_chorus) snprintf(ctx, sizeof(ctx), "%s", prompt);   /* CHORUS: each cell answers the SAME prompt from its own angle; awareness via cross-cell, not text */
         else if (g_leap_mode && r > 0) {             /* RELAY (legacy): dissonance-into-forward route */
@@ -864,9 +873,9 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
         if (out_shuf) {                              /* Δ_R shadow: same ctx, tail shuffled, field OFF, raw entropy */
             memcpy(sids, ids, (size_t)np * sizeof(int));
             if (np > np_prompt) shuffle_ids(sids, np_prompt, np, seed ^ 0x5bd1e995u);
-            int save_on = g_field_on; g_field_on = 0;
+            int save_on = g_field_on; g_field_on = 0; int save_tok = g_round_tokn;
             shuf_sum += cell_speak(m, tok, sids, np, nfrag, temp, 40, 1.4f, seed, eos, max_seq, NULL, 0, 0, NULL, NULL, NULL, NULL, NULL);
-            g_field_on = save_on;
+            g_field_on = save_on; g_round_tokn = save_tok;   /* shadow doesn't pollute the cross-rep word-memory */
         }
         if (verbose) printf("   [entropy=%.2f]", ent);
         if (flog) fprintf(flog, "- cell %d (T=%.2f, entropy=%.2f):%s\n", c, temp, ent, frag);
@@ -1022,6 +1031,7 @@ int main(int argc, char **argv) {
         g_leap_mode  = argc > 8 ? atoi(argv[8]) : 2;             /* DEFAULT ALIVE: leap-v2 (dissenter-last). 0 = baseline */
         g_xcell      = argc > 9 ? (float)atof(argv[9]) : 0.3f;   /* DEFAULT ALIVE: λ=0.3 balanced cross-cell. 0 = off */
         g_chorus     = argc > 10 ? atoi(argv[10]) : 1;           /* DEFAULT: 1 = chorus (each cell own answer). 0 = relay */
+        g_xrep       = argc > 11 ? (float)atof(argv[11]) : 1.3f; /* cross-cell rep-penalty: don't echo neighbours' words (1=off) */
         if (n_cells <= 0) {   /* auto: the field sizes itself from the prompt's entropy */
             float pe = probe_entropy(m, tok, prompt);
             n_cells = (int)(pe + 0.5f); if (n_cells < 1) n_cells = 1; if (n_cells > 8) n_cells = 8;
