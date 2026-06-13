@@ -629,6 +629,17 @@ static int dissenter_cell(int n_cells) {   /* lowest-index cell whose committed 
     return n_cells > 1 ? 1 : 0;
 }
 
+static int modal_cell(int n_cells) {   /* null-test: the CONSENSUS cell (lowest-index modal) at g_s_peak */
+    int s = g_s_peak; if (s < 0 || s >= 64) return 0;
+    int modal = -1, mc = -1;
+    for (int c = 0; c < n_cells && c < 8; c++) if (s < g_diss_commit_n[c]) {
+        int v = 0; for (int k = 0; k < n_cells && k < 8; k++) if (s < g_diss_commit_n[k] && g_diss_commit[k][s] == g_diss_commit[c][s]) v++;
+        if (v > mc) { mc = v; modal = g_diss_commit[c][s]; }
+    }
+    for (int c = 0; c < n_cells && c < 8; c++) if (s < g_diss_commit_n[c] && g_diss_commit[c][s] == modal) return c;
+    return 0;
+}
+
 static float cell_speak(model_t *m, bpe_tokenizer *tok, const int *ids, int np, int nfrag,
                         float temp, int top_k, float rep, unsigned seed, int eos, int max_seq,
                         char *frag, int frag_cap, int verbose, int *out_ids, int *out_n, int *out_commit) {
@@ -713,9 +724,15 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
     for (int c = 0; c < n_cells; c++) {
         if (g_leap_mode && r > 0) {                  /* dissonance-into-forward: route the cell by the prior round's split */
             g_leap_total++;
-            if (g_dpeak >= THETA_HI) {               /* LEAP: prefill prompt + ONLY the prior-round dissenter's fragment */
-                int dis = dissenter_cell(n_cells); g_leap_flips++;
-                snprintf(ctx, sizeof(ctx), "%s %s", prompt, g_round_frag[dis]);
+            if (g_dpeak >= THETA_HI) {
+                int dis = (g_leap_mode == 3) ? modal_cell(n_cells) : dissenter_cell(n_cells); g_leap_flips++;  /* leap=3 null: consensus last */
+                if (g_leap_mode >= 2) {              /* v2/null: keep the FULL chorus, chosen voice MOST-RECENT (recency=attention) */
+                    int off = snprintf(ctx, sizeof(ctx), "%s", prompt);
+                    for (int k = 0; k < n_cells && k < 8; k++) if (k != dis && off < (int)sizeof(ctx) - 1)
+                        off += snprintf(ctx + off, sizeof(ctx) - off, " %s", g_round_frag[k]);
+                    if (off < (int)sizeof(ctx) - 1) off += snprintf(ctx + off, sizeof(ctx) - off, " %s", g_round_frag[dis]);  /* dissenter last */
+                    if (off < (int)sizeof(ctx) - 1) snprintf(ctx + off, sizeof(ctx) - off, "%s", this_chorus);
+                } else snprintf(ctx, sizeof(ctx), "%s %s", prompt, g_round_frag[dis]);   /* v1: ONLY the dissenter (short) */
             } else snprintf(ctx, sizeof(ctx), "%s%s%s", prompt, prev_chorus ? prev_chorus : "", this_chorus);  /* CONVERGE: full */
         } else snprintf(ctx, sizeof(ctx), "%s%s%s", prompt, prev_chorus ? prev_chorus : "", this_chorus);
         int np = bpe_encode(tok, ctx, ids, max_seq - nfrag - 1);
