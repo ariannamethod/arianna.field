@@ -468,14 +468,21 @@ static model_t *model_load(gguf_file *gf) {
     return m;
 }
 
-typedef struct { float *k, *v; int max_seq, kv_dim; } kv_cache;
+typedef struct { float *k, *v, *ku; int max_seq, kv_dim; } kv_cache;
 static kv_cache *kv_new(int nl, int max_seq, int kv_dim) {
     kv_cache *c = calloc(1, sizeof(kv_cache));
     c->k = calloc((long)nl*max_seq*kv_dim, sizeof(float)); c->v = calloc((long)nl*max_seq*kv_dim, sizeof(float));
+    c->ku = calloc((long)nl*max_seq*kv_dim, sizeof(float));   /* un-rope'd K — phase-coherent cross-cell scores */
     c->max_seq = max_seq; c->kv_dim = kv_dim; return c;
 }
 
 /* single token forward, KV-cached. Writes logits[vocab]. */
+/* cross-cell attention: a cell also attends to a NEIGHBOUR voice's hidden K/V at each layer (forward-level,
+ * order-sensitive coupling). g_nbr = the neighbour's kv_cache, g_nbr_len = its valid positions. Default off. */
+static int g_xcell = 0;
+static const kv_cache *g_nbr = NULL;
+static int g_nbr_len = 0;
+
 static void forward(model_t *m, kv_cache *kv, int token, int pos, float *logits) {
     int E = m->embed, H = m->n_heads, KV = m->n_kv_heads, HD = m->head_dim;
     int KVD = m->kv_dim, FFN = m->ffn, QD = m->q_dim, gqa = H / KV; float eps = m->rms_eps;
@@ -483,8 +490,8 @@ static void forward(model_t *m, kv_cache *kv, int token, int pos, float *logits)
 
     float *x = calloc(E, sizeof(float)); memcpy(x, m->tok_emb + (long)token*E, E*sizeof(float));
     float *xn = calloc(E, sizeof(float)), *q = calloc(QD, sizeof(float)), *kk = calloc(KVD, sizeof(float));
-    float *vv = calloc(KVD, sizeof(float)), *ao = calloc(QD, sizeof(float)), *g = calloc(FFN, sizeof(float));
-    float *u = calloc(FFN, sizeof(float)), *t = calloc(E, sizeof(float)), *sc = calloc(kv->max_seq, sizeof(float));
+    float *vv = calloc(KVD, sizeof(float)), *ao = calloc(QD, sizeof(float)), *g = calloc(FFN, sizeof(float)), *qu = calloc(QD, sizeof(float));
+    float *u = calloc(FFN, sizeof(float)), *t = calloc(E, sizeof(float)), *sc = calloc((size_t)kv->max_seq * 2, sizeof(float));
 
     for (int l = 0; l < m->n_layers; l++) {
         rmsnorm(xn, x, m->L[l].attn_norm, E, eps);
@@ -493,19 +500,24 @@ static void forward(model_t *m, kv_cache *kv, int token, int pos, float *logits)
             for (int h = 0; h < H;  h++) rmsnorm(q + h*HD, q + h*HD, m->L[l].q_norm, HD, eps);
             for (int h = 0; h < KV; h++) rmsnorm(kk + h*HD, kk + h*HD, m->L[l].k_norm, HD, eps);
         }
+        long base = (long)l*kv->max_seq*KVD;
+        memcpy(kv->ku + base + (long)pos*KVD, kk, (size_t)KVD*sizeof(float));   /* un-rope'd K (phase-coherent cross-cell) */
+        memcpy(qu, q, (size_t)QD*sizeof(float));                                /* un-rope'd q for cross-cell scores */
         for (int h = 0; h < H;  h++) ropef(q + h*HD, pos, HD, m->rope_base);
         for (int h = 0; h < KV; h++) ropef(kk + h*HD, pos, HD, m->rope_base);
-
-        long base = (long)l*kv->max_seq*KVD;
         memcpy(kv->k + base + (long)pos*KVD, kk, KVD*sizeof(float));
         memcpy(kv->v + base + (long)pos*KVD, vv, KVD*sizeof(float));
 
         float scale = 1.0f / sqrtf((float)HD); memset(ao, 0, QD*sizeof(float));
+        int xc = (g_xcell && g_nbr && g_nbr_len > 0) ? g_nbr_len : 0;   /* extra neighbour-voice positions */
+        long nbase = xc ? (long)l * g_nbr->max_seq * KVD : 0;
         for (int h = 0; h < H; h++) {
-            int kvh = h / gqa; float *qh = q + h*HD;
+            int kvh = h / gqa; float *qh = q + h*HD; const float *quh = qu + h*HD; int np = pos + 1;
             for (int j = 0; j <= pos; j++) { float *kj = kv->k + base + (long)j*KVD + kvh*HD, d = 0; for (int t2 = 0; t2 < HD; t2++) d += qh[t2]*kj[t2]; sc[j] = d*scale; }
-            softmax(sc, pos + 1); float *oh = ao + h*HD;
+            for (int j = 0; j < xc; j++) { const float *kj = g_nbr->ku + nbase + (long)j*KVD + kvh*HD; float d = 0; for (int t2 = 0; t2 < HD; t2++) d += quh[t2]*kj[t2]; sc[np + j] = d*scale; }
+            softmax(sc, np + xc); float *oh = ao + h*HD;
             for (int j = 0; j <= pos; j++) { float *vj = kv->v + base + (long)j*KVD + kvh*HD, w = sc[j]; for (int t2 = 0; t2 < HD; t2++) oh[t2] += w*vj[t2]; }
+            for (int j = 0; j < xc; j++) { const float *vj = g_nbr->v + nbase + (long)j*KVD + kvh*HD; float w = sc[np + j]; for (int t2 = 0; t2 < HD; t2++) oh[t2] += w*vj[t2]; }
         }
         matvec(t, m->L[l].wo, ao, E, QD); for (int i = 0; i < E; i++) x[i] += t[i];
 
@@ -516,7 +528,7 @@ static void forward(model_t *m, kv_cache *kv, int token, int pos, float *logits)
     }
     rmsnorm(xn, x, m->out_norm, E, eps);
     matvec(logits, m->output, xn, m->vocab, E);
-    free(x); free(xn); free(q); free(kk); free(vv); free(ao); free(g); free(u); free(t); free(sc);
+    free(x); free(xn); free(q); free(kk); free(vv); free(ao); free(g); free(u); free(t); free(sc); free(qu);
 }
 
 static int argmax(const float *x, int n) { int b = 0; for (int i = 1; i < n; i++) if (x[i] > x[b]) b = i; return b; }
@@ -642,13 +654,14 @@ static int modal_cell(int n_cells) {   /* null-test: the CONSENSUS cell (lowest-
 
 static float cell_speak(model_t *m, bpe_tokenizer *tok, const int *ids, int np, int nfrag,
                         float temp, int top_k, float rep, unsigned seed, int eos, int max_seq,
-                        char *frag, int frag_cap, int verbose, int *out_ids, int *out_n, int *out_commit) {
+                        char *frag, int frag_cap, int verbose, int *out_ids, int *out_n, int *out_commit,
+                        kv_cache **out_kv, int *out_klen) {
     srand(seed);
     kv_cache *kv = kv_new(m->n_layers, max_seq, m->kv_dim);
     float *logits = (float*)calloc(m->vocab, sizeof(float));
     float *fproj  = (g_field_on && g_field_alpha > 0) ? (float*)calloc(m->vocab, sizeof(float)) : NULL;
     for (int i = 0; i < np; i++) forward(m, kv, ids[i], i, logits);
-    int hist[256], hlen = 0; char buf[256]; float ent_acc = 0; int ent_n = 0, fl = 0;
+    int hist[256], hlen = 0; char buf[256]; float ent_acc = 0; int ent_n = 0, fl = 0, klen = np;
     for (int s = 0; s < nfrag; s++) {
         ent_acc += logit_entropy(logits, m->vocab, temp); ent_n++;   /* RAW forward entropy (pre-injection) — clean for Δ_R */
         if (out_commit && s < 64) out_commit[s] = argmax(logits, m->vocab);  /* committed direction (raw argmax) — the order-true signal */
@@ -667,11 +680,13 @@ static float cell_speak(model_t *m, bpe_tokenizer *tok, const int *ids, int np, 
             for (int i = 0; i < m->embed && i < 8192; i++) g_field_dir[i] = g_field_dir[i]*0.92f + e[i]*0.08f;
         }
         int pos = np + s; if (pos >= max_seq - 1) break;
-        forward(m, kv, next, pos, logits);
+        forward(m, kv, next, pos, logits); klen = pos + 1;
     }
     if (frag) frag[fl] = 0;
     if (out_n) { *out_n = hlen; if (out_ids) for (int i = 0; i < hlen; i++) out_ids[i] = hist[i]; }
-    free(logits); if (fproj) free(fproj); free(kv->k); free(kv->v); free(kv);
+    free(logits); if (fproj) free(fproj);
+    if (out_kv) { *out_kv = kv; if (out_klen) *out_klen = klen; }   /* hand kv to the caller (cross-cell chain); caller frees */
+    else { free(kv->k); free(kv->v); free(kv->ku); free(kv); }
     return ent_n ? ent_acc / ent_n : 0.0f;
 }
 
@@ -684,7 +699,7 @@ static float probe_entropy(model_t *m, bpe_tokenizer *tok, const char *prompt) {
     float *logits = (float*)calloc(m->vocab, sizeof(float));
     for (int i = 0; i < np; i++) forward(m, kv, ids[i], i, logits);
     float ent = logit_entropy(logits, m->vocab, 1.0f);
-    free(logits); free(kv->k); free(kv->v); free(kv);
+    free(logits); free(kv->k); free(kv->v); free(kv->ku); free(kv);
     return ent;
 }
 
@@ -721,6 +736,7 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
     float ent_sum = 0, shuf_sum = 0;
     float *cent = out_disso ? (float*)calloc((size_t)n_cells * m->embed, sizeof(float)) : NULL;  /* per-cell fragment centroids → D_R */
     char cur_frag[8][1024];   /* this round's per-cell fragments → cached to g_round_frag for next round's leap */
+    kv_cache *prev_kv = NULL; int prev_len = 0;   /* cross-cell: the prior cell's KV, attended by the next cell */
     for (int c = 0; c < n_cells; c++) {
         if (g_leap_mode && r > 0) {                  /* dissonance-into-forward: route the cell by the prior round's split */
             g_leap_total++;
@@ -740,9 +756,12 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
         unsigned seed = seed_base + (unsigned)c * 7919u;
         if (verbose) printf("\n  r%d cell %d (T=%.2f): ", r + 1, c, temp);
         cell_n = 0;
+        g_nbr = prev_kv; g_nbr_len = prev_len;        /* cross-cell: this cell hears the prior cell's KV */
+        kv_cache *cur_kv = NULL; int cur_len = 0;
         float ent = cell_speak(m, tok, ids, np, nfrag, temp, 40, 1.4f, seed, eos, max_seq,
                                frag, sizeof(frag), verbose, cell_ids, &cell_n,
-                               (out_disso && c < 8) ? g_commit[c] : NULL);
+                               (out_disso && c < 8) ? g_commit[c] : NULL,
+                               g_xcell ? &cur_kv : NULL, g_xcell ? &cur_len : NULL);
         if (out_disso && c < 8) g_commit_n[c] = cell_n;
         ent_sum += ent;
         for (int i = 0; i < cell_n; i++) if (cell_ids[i] >= 0 && cell_ids[i] < m->vocab) hist[cell_ids[i]]++;
@@ -755,7 +774,7 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
             memcpy(sids, ids, (size_t)np * sizeof(int));
             if (np > np_prompt) shuffle_ids(sids, np_prompt, np, seed ^ 0x5bd1e995u);
             int save_on = g_field_on; g_field_on = 0;
-            shuf_sum += cell_speak(m, tok, sids, np, nfrag, temp, 40, 1.4f, seed, eos, max_seq, NULL, 0, 0, NULL, NULL, NULL);
+            shuf_sum += cell_speak(m, tok, sids, np, nfrag, temp, 40, 1.4f, seed, eos, max_seq, NULL, 0, 0, NULL, NULL, NULL, NULL, NULL);
             g_field_on = save_on;
         }
         if (verbose) printf("   [entropy=%.2f]", ent);
@@ -763,7 +782,10 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
         int add = snprintf(this_chorus + tc, sizeof(this_chorus) - tc, " %s", frag);
         if (add > 0 && tc + add < (int)sizeof(this_chorus)) tc += add;
         if (c < 8) { strncpy(cur_frag[c], frag, 1023); cur_frag[c][1023] = 0; }
+        if (g_xcell) { if (prev_kv) { free(prev_kv->k); free(prev_kv->v); free(prev_kv->ku); free(prev_kv); } prev_kv = cur_kv; prev_len = cur_len; }  /* chain c→c+1 */
     }
+    if (prev_kv) { free(prev_kv->k); free(prev_kv->v); free(prev_kv->ku); free(prev_kv); }   /* free the last cell's kept kv */
+    g_nbr = NULL; g_nbr_len = 0;
     if (out_chorus) { strncpy(out_chorus, this_chorus, (size_t)out_cap - 1); out_chorus[out_cap - 1] = 0; }
     if (out_shuf) *out_shuf = shuf_sum / n_cells;
     if (out_disso) {                              /* D_R = 1 − mean pairwise cosine of cell fragment centroids (voice-disagreement) */
@@ -869,7 +891,7 @@ static void field_resonance_test(model_t *m, bpe_tokenizer *tok, const char *pro
                 if (control && np > np_prompt) shuffle_ids(ids, np_prompt, np, 12345u + (unsigned)(r * 31 + c));
                 float temp = 0.6f + 0.7f * (n_cells > 1 ? (float)c / (n_cells - 1) : 0.5f);
                 ent_sum += cell_speak(m, tok, ids, np, nfrag, temp, 40, 1.4f,
-                                      42u + (unsigned)(r * 1000 + c) * 7919u, eos, max_seq, frag, sizeof(frag), 0, NULL, NULL, NULL);
+                                      42u + (unsigned)(r * 1000 + c) * 7919u, eos, max_seq, frag, sizeof(frag), 0, NULL, NULL, NULL, NULL, NULL);
                 int add = snprintf(this_chorus + tc, sizeof(this_chorus) - tc, " %s", frag);
                 if (add > 0 && tc + add < (int)sizeof(this_chorus)) tc += add;
             }
@@ -907,6 +929,7 @@ int main(int argc, char **argv) {
         int n_rounds = argc > 6 ? atoi(argv[6]) : 1;
         float alpha  = argc > 7 ? (float)atof(argv[7]) : 0.0f;   /* soma coupling strength (0 = text-only baseline) */
         g_leap_mode  = argc > 8 ? atoi(argv[8]) : 0;             /* 1 = dissonance-into-forward leap (arm C) */
+        g_xcell      = argc > 9 ? atoi(argv[9]) : 0;             /* 1 = cross-cell KV attention (cell hears prior cell's K/V) */
         if (n_cells <= 0) {   /* auto: the field sizes itself from the prompt's entropy */
             float pe = probe_entropy(m, tok, prompt);
             n_cells = (int)(pe + 0.5f); if (n_cells < 1) n_cells = 1; if (n_cells > 8) n_cells = 8;
