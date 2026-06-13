@@ -479,7 +479,7 @@ static kv_cache *kv_new(int nl, int max_seq, int kv_dim) {
 /* single token forward, KV-cached. Writes logits[vocab]. */
 /* cross-cell attention: a cell also attends to a NEIGHBOUR voice's hidden K/V at each layer (forward-level,
  * order-sensitive coupling). g_nbr = the neighbour's kv_cache, g_nbr_len = its valid positions. Default off. */
-static int g_xcell = 0;
+static float g_xcell = 0.0f;   /* cross-cell neighbour-channel weight λ (0 = off): balanced own-ctx + λ·neighbour */
 static const kv_cache *g_nbr = NULL;
 static int g_nbr_len = 0;
 
@@ -491,7 +491,8 @@ static void forward(model_t *m, kv_cache *kv, int token, int pos, float *logits)
     float *x = calloc(E, sizeof(float)); memcpy(x, m->tok_emb + (long)token*E, E*sizeof(float));
     float *xn = calloc(E, sizeof(float)), *q = calloc(QD, sizeof(float)), *kk = calloc(KVD, sizeof(float));
     float *vv = calloc(KVD, sizeof(float)), *ao = calloc(QD, sizeof(float)), *g = calloc(FFN, sizeof(float)), *qu = calloc(QD, sizeof(float));
-    float *u = calloc(FFN, sizeof(float)), *t = calloc(E, sizeof(float)), *sc = calloc((size_t)kv->max_seq * 2, sizeof(float));
+    float *u = calloc(FFN, sizeof(float)), *t = calloc(E, sizeof(float)), *sc = calloc((size_t)kv->max_seq, sizeof(float));
+    float *scn = calloc((size_t)kv->max_seq, sizeof(float));   /* neighbour-channel scores (separate softmax) */
 
     for (int l = 0; l < m->n_layers; l++) {
         rmsnorm(xn, x, m->L[l].attn_norm, E, eps);
@@ -509,15 +510,19 @@ static void forward(model_t *m, kv_cache *kv, int token, int pos, float *logits)
         memcpy(kv->v + base + (long)pos*KVD, vv, KVD*sizeof(float));
 
         float scale = 1.0f / sqrtf((float)HD); memset(ao, 0, QD*sizeof(float));
-        int xc = (g_xcell && g_nbr && g_nbr_len > 0) ? g_nbr_len : 0;   /* extra neighbour-voice positions */
+        int xc = (g_xcell > 0 && g_nbr && g_nbr_len > 0) ? g_nbr_len : 0;   /* neighbour positions (separate channel) */
         long nbase = xc ? (long)l * g_nbr->max_seq * KVD : 0;
         for (int h = 0; h < H; h++) {
             int kvh = h / gqa; float *qh = q + h*HD; const float *quh = qu + h*HD; int np = pos + 1;
+            /* OWN attention — UNCHANGED from baseline (preserves own-context order = Δ_R) */
             for (int j = 0; j <= pos; j++) { float *kj = kv->k + base + (long)j*KVD + kvh*HD, d = 0; for (int t2 = 0; t2 < HD; t2++) d += qh[t2]*kj[t2]; sc[j] = d*scale; }
-            for (int j = 0; j < xc; j++) { const float *kj = g_nbr->ku + nbase + (long)j*KVD + kvh*HD; float d = 0; for (int t2 = 0; t2 < HD; t2++) d += quh[t2]*kj[t2]; sc[np + j] = d*scale; }
-            softmax(sc, np + xc); float *oh = ao + h*HD;
+            softmax(sc, np); float *oh = ao + h*HD;
             for (int j = 0; j <= pos; j++) { float *vj = kv->v + base + (long)j*KVD + kvh*HD, w = sc[j]; for (int t2 = 0; t2 < HD; t2++) oh[t2] += w*vj[t2]; }
-            for (int j = 0; j < xc; j++) { const float *vj = g_nbr->v + nbase + (long)j*KVD + kvh*HD; float w = sc[np + j]; for (int t2 = 0; t2 < HD; t2++) oh[t2] += w*vj[t2]; }
+            if (xc) {   /* NEIGHBOUR channel — SEPARATE softmax, added with weight λ (own ctx + λ·neighbour) */
+                for (int j = 0; j < xc; j++) { const float *kj = g_nbr->ku + nbase + (long)j*KVD + kvh*HD; float d = 0; for (int t2 = 0; t2 < HD; t2++) d += quh[t2]*kj[t2]; scn[j] = d*scale; }
+                softmax(scn, xc);
+                for (int j = 0; j < xc; j++) { const float *vj = g_nbr->v + nbase + (long)j*KVD + kvh*HD; float w = g_xcell * scn[j]; for (int t2 = 0; t2 < HD; t2++) oh[t2] += w*vj[t2]; }
+            }
         }
         matvec(t, m->L[l].wo, ao, E, QD); for (int i = 0; i < E; i++) x[i] += t[i];
 
@@ -528,7 +533,7 @@ static void forward(model_t *m, kv_cache *kv, int token, int pos, float *logits)
     }
     rmsnorm(xn, x, m->out_norm, E, eps);
     matvec(logits, m->output, xn, m->vocab, E);
-    free(x); free(xn); free(q); free(kk); free(vv); free(ao); free(g); free(u); free(t); free(sc); free(qu);
+    free(x); free(xn); free(q); free(kk); free(vv); free(ao); free(g); free(u); free(t); free(sc); free(scn); free(qu);
 }
 
 static int argmax(const float *x, int n) { int b = 0; for (int i = 1; i < n; i++) if (x[i] > x[b]) b = i; return b; }
@@ -761,7 +766,7 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
         float ent = cell_speak(m, tok, ids, np, nfrag, temp, 40, 1.4f, seed, eos, max_seq,
                                frag, sizeof(frag), verbose, cell_ids, &cell_n,
                                (out_disso && c < 8) ? g_commit[c] : NULL,
-                               g_xcell ? &cur_kv : NULL, g_xcell ? &cur_len : NULL);
+                               g_xcell > 0 ? &cur_kv : NULL, g_xcell > 0 ? &cur_len : NULL);
         if (out_disso && c < 8) g_commit_n[c] = cell_n;
         ent_sum += ent;
         for (int i = 0; i < cell_n; i++) if (cell_ids[i] >= 0 && cell_ids[i] < m->vocab) hist[cell_ids[i]]++;
@@ -782,7 +787,7 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
         int add = snprintf(this_chorus + tc, sizeof(this_chorus) - tc, " %s", frag);
         if (add > 0 && tc + add < (int)sizeof(this_chorus)) tc += add;
         if (c < 8) { strncpy(cur_frag[c], frag, 1023); cur_frag[c][1023] = 0; }
-        if (g_xcell) { if (prev_kv) { free(prev_kv->k); free(prev_kv->v); free(prev_kv->ku); free(prev_kv); } prev_kv = cur_kv; prev_len = cur_len; }  /* chain c→c+1 */
+        if (g_xcell > 0) { if (prev_kv) { free(prev_kv->k); free(prev_kv->v); free(prev_kv->ku); free(prev_kv); } prev_kv = cur_kv; prev_len = cur_len; }  /* chain c→c+1 */
     }
     if (prev_kv) { free(prev_kv->k); free(prev_kv->v); free(prev_kv->ku); free(prev_kv); }   /* free the last cell's kept kv */
     g_nbr = NULL; g_nbr_len = 0;
@@ -928,8 +933,8 @@ int main(int argc, char **argv) {
         int nfrag    = argc > 5 ? atoi(argv[5]) : 16;
         int n_rounds = argc > 6 ? atoi(argv[6]) : 1;
         float alpha  = argc > 7 ? (float)atof(argv[7]) : 0.0f;   /* soma coupling strength (0 = text-only baseline) */
-        g_leap_mode  = argc > 8 ? atoi(argv[8]) : 0;             /* 1 = dissonance-into-forward leap (arm C) */
-        g_xcell      = argc > 9 ? atoi(argv[9]) : 0;             /* 1 = cross-cell KV attention (cell hears prior cell's K/V) */
+        g_leap_mode  = argc > 8 ? atoi(argv[8]) : 2;             /* DEFAULT ALIVE: leap-v2 (dissenter-last). 0 = baseline */
+        g_xcell      = argc > 9 ? (float)atof(argv[9]) : 0.3f;   /* DEFAULT ALIVE: λ=0.3 balanced cross-cell. 0 = off */
         if (n_cells <= 0) {   /* auto: the field sizes itself from the prompt's entropy */
             float pe = probe_entropy(m, tok, prompt);
             n_cells = (int)(pe + 0.5f); if (n_cells < 1) n_cells = 1; if (n_cells > 8) n_cells = 8;
