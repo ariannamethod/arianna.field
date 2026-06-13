@@ -25,6 +25,10 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#define Q_NEON 1
+#endif
 
 /* ===================== GGUF parser (vendored: notorch/gguf.{c,h}) ===================== */
 
@@ -337,15 +341,72 @@ static int utf8_len1(const char *s) {   /* bytes in the UTF-8 char at s */
     if (c < 0x80) return 1; if ((c>>5)==0x6) return 2; if ((c>>4)==0xE) return 3; if ((c>>3)==0x1E) return 4; return 1;
 }
 
-typedef struct { char **tokens; int n_tokens; float *scores; smap vocab; } bpe_tokenizer;
+typedef struct { char **tokens; int n_tokens; float *scores; smap vocab;
+                 int is_bpe; char **merges; int n_merges; smap merge_rank; smap u2b; char b2u[256][5]; } bpe_tokenizer;
+
+/* GPT-2 byte→unicode: printable bytes map to themselves; others to U+0100+ (byte 32 space → U+0120 Ġ).
+ * The reverse (unicode char → byte) goes in u2b for decode. Used by llama-arch bodies with .merges. */
+static void gpt2_byte_maps(bpe_tokenizer *t) {
+    int used[256]; for (int i = 0; i < 256; i++) used[i] = 0;
+    for (int b = 33; b <= 126; b++) used[b] = 1;
+    for (int b = 161; b <= 172; b++) used[b] = 1;
+    for (int b = 174; b <= 255; b++) used[b] = 1;
+    int n = 0;
+    for (int b = 0; b < 256; b++) {
+        int cp = used[b] ? b : (256 + n); if (!used[b]) n++;
+        char *o = t->b2u[b]; int k = 0;
+        if (cp < 0x80) o[k++] = (char)cp;
+        else if (cp < 0x800) { o[k++] = (char)(0xC0|(cp>>6)); o[k++] = (char)(0x80|(cp&0x3F)); }
+        else { o[k++] = (char)(0xE0|(cp>>12)); o[k++] = (char)(0x80|((cp>>6)&0x3F)); o[k++] = (char)(0x80|(cp&0x3F)); }
+        o[k] = 0; smap_put(&t->u2b, o, b);
+    }
+}
+/* GPT-2 byte-level BPE encode: bytes→b2u symbols, then merge the adjacent pair with the lowest rank. */
+static int bpe_encode_gpt2(const bpe_tokenizer *t, const char *text, int *out, int cap) {
+    int tl = (int)strlen(text); if (tl == 0) return 0;
+    char **sym = (char**)malloc(((size_t)tl + 1) * sizeof(char*)); int nsym = 0;
+    for (int i = 0; i < tl; i++) sym[nsym++] = strdup(t->b2u[(unsigned char)text[i]]);
+    while (nsym > 1) {
+        int best = 1<<30, bi = -1; char key[1024];
+        for (int i = 0; i < nsym - 1; i++) {
+            snprintf(key, sizeof(key), "%s %s", sym[i], sym[i+1]);
+            int r = smap_get(&t->merge_rank, key);
+            if (r >= 0 && r < best) { best = r; bi = i; }
+        }
+        if (bi < 0) break;
+        char *mg = (char*)malloc(strlen(sym[bi]) + strlen(sym[bi+1]) + 1);
+        strcpy(mg, sym[bi]); strcat(mg, sym[bi+1]); free(sym[bi]); free(sym[bi+1]); sym[bi] = mg;
+        for (int i = bi + 1; i < nsym - 1; i++) sym[i] = sym[i+1]; nsym--;
+    }
+    int no = 0;
+    for (int i = 0; i < nsym; i++) { int id = smap_get(&t->vocab, sym[i]); if (id >= 0 && no < cap) out[no++] = id; free(sym[i]); }
+    free(sym); return no;
+}
+/* GPT-2 decode: the token string is b2u-mapped; map each unicode char back to its byte via u2b. */
+static int bpe_decode_gpt2(const bpe_tokenizer *t, int id, char *buf, int cap) {
+    const char *s = t->tokens[id]; int n = 0;
+    for (int i = 0; s[i] && n < cap - 1; ) {
+        int adv = utf8_len1(s + i); if (adv > 4) adv = 1; char ch[5]; memcpy(ch, s + i, adv); ch[adv] = 0;
+        int b = smap_get(&t->u2b, ch);
+        if (b >= 0) buf[n++] = (char)b; else for (int k = 0; k < adv && n < cap - 1; k++) buf[n++] = s[i+k];
+        i += adv;
+    }
+    buf[n] = 0; return n;
+}
 
 static bpe_tokenizer *bpe_load(const char *path) {
     int nt = 0; char **toks = gguf_read_str_array(path, "tokenizer.ggml.tokens", &nt);
     if (!toks || nt <= 0) return NULL;
     int nsc = 0; float *scores = gguf_read_f32_array(path, "tokenizer.ggml.scores", &nsc);
+    int nmg = 0; char **merges = gguf_read_str_array(path, "tokenizer.ggml.merges", &nmg);
     bpe_tokenizer *t = (bpe_tokenizer*)calloc(1, sizeof(*t));
     t->tokens = toks; t->n_tokens = nt; t->scores = scores;
     smap_init(&t->vocab, nt * 2); for (int i = 0; i < nt; i++) if (toks[i]) smap_put(&t->vocab, toks[i], i);
+    if (merges && nmg > 0) {                 /* BPE (GPT-2 byte-level): SmolLM2 / qwen / llama-3 */
+        t->is_bpe = 1; t->merges = merges; t->n_merges = nmg;
+        smap_init(&t->merge_rank, nmg * 2); for (int i = 0; i < nmg; i++) if (merges[i]) smap_put(&t->merge_rank, merges[i], i);
+        smap_init(&t->u2b, 600); gpt2_byte_maps(t);
+    }
     return t;
 }
 static int bpe_n_vocab(const bpe_tokenizer *t) { return t ? t->n_tokens : 0; }
@@ -353,6 +414,7 @@ static int bpe_n_vocab(const bpe_tokenizer *t) { return t ? t->n_tokens : 0; }
 /* SPM encode: prepend ▁, spaces→▁, then greedily merge the adjacent pair whose
  * concatenation has the highest vocab score; byte-fallback (<0xXX>) for unknown symbols. */
 static int bpe_encode(const bpe_tokenizer *t, const char *text, int *out, int cap) {
+    if (t->is_bpe) return bpe_encode_gpt2(t, text, out, cap);
     int tl = (int)strlen(text);
     char *s = (char*)malloc((size_t)tl*3 + 4); int sl = 0;
     s[sl++]=(char)0xE2; s[sl++]=(char)0x96; s[sl++]=(char)0x81;            /* leading ▁ */
@@ -393,6 +455,7 @@ static int bpe_encode(const bpe_tokenizer *t, const char *text, int *out, int ca
 /* SPM decode: <0xXX> → that byte; ▁ → space; else literal UTF-8 bytes. */
 static int bpe_decode_token(const bpe_tokenizer *t, int id, char *buf, int cap) {
     if (!t || id < 0 || id >= t->n_tokens || !t->tokens[id]) return 0;
+    if (t->is_bpe) return bpe_decode_gpt2(t, id, buf, cap);
     const char *s = t->tokens[id]; int n = 0;
     if (s[0]=='<' && s[1]=='0' && s[2]=='x' && s[3] && s[4] && s[5]=='>' && s[6]==0) {
         int v; if (sscanf(s+3, "%2x", &v) == 1) { if (n < cap-1) buf[n++] = (char)v; buf[n] = 0; return n; }
@@ -416,9 +479,29 @@ static void softmax(float *x, int n) {
     float mx = x[0]; for (int i = 1; i < n; i++) if (x[i] > mx) mx = x[i];
     float s = 0; for (int i = 0; i < n; i++) { x[i] = expf(x[i]-mx); s += x[i]; } for (int i = 0; i < n; i++) x[i] /= s;
 }
+#ifdef Q_NEON
+/* hand-vectorised matvec — 4 NEON FMA accumulators (16 f32/iter), the punk "BLAS in C". Scalar fallback below. */
+static void matvec(float *y, const float *W, const float *x, int m, int k) {
+    for (int i = 0; i < m; i++) {
+        const float *row = W + (long)i*k;
+        float32x4_t a0 = vdupq_n_f32(0), a1 = vdupq_n_f32(0), a2 = vdupq_n_f32(0), a3 = vdupq_n_f32(0);
+        int j = 0;
+        for (; j + 16 <= k; j += 16) {
+            a0 = vfmaq_f32(a0, vld1q_f32(row+j),    vld1q_f32(x+j));
+            a1 = vfmaq_f32(a1, vld1q_f32(row+j+4),  vld1q_f32(x+j+4));
+            a2 = vfmaq_f32(a2, vld1q_f32(row+j+8),  vld1q_f32(x+j+8));
+            a3 = vfmaq_f32(a3, vld1q_f32(row+j+12), vld1q_f32(x+j+12));
+        }
+        float s = vaddvq_f32(vaddq_f32(vaddq_f32(a0,a1), vaddq_f32(a2,a3)));
+        for (; j < k; j++) s += row[j]*x[j];
+        y[i] = s;
+    }
+}
+#else
 static void matvec(float *y, const float *W, const float *x, int m, int k) {
     for (int i = 0; i < m; i++) { const float *row = W + (long)i*k; float s = 0; for (int j = 0; j < k; j++) s += row[j]*x[j]; y[i] = s; }
 }
+#endif
 static void rope_interleaved(float *x, int pos, int hd, float base) {
     for (int i = 0; i < hd/2; i++) { float a = pos/powf(base, 2.0f*i/hd), c = cosf(a), s = sinf(a); float x0 = x[2*i], x1 = x[2*i+1]; x[2*i] = x0*c - x1*s; x[2*i+1] = x0*s + x1*c; }
 }
