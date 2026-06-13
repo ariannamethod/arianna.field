@@ -822,6 +822,46 @@ static float vec_cosine(const float *a, const float *b, int n) {
     return (na == 0 || nb == 0) ? 0.0f : (float)(dot / (sqrt(na) * sqrt(nb)));
 }
 
+/* ── δ-life: the Game of Life over ANGLES (a cell is perception, the body is shared+fixed) ── */
+#define POP_MAX  8        /* hard cap = the instrument arrays g_commit[8] etc.; real-100 is a Phase-2 widening */
+#define F_DEATH  0.30f    /* config.py:12 DEATH_THRESHOLD */
+#define F_REPRO  0.65f    /* config.py:13 REPRODUCTION_THRESHOLD */
+#define POP_NMIN 2        /* below this → resurrection (never extinct) */
+typedef struct { float temp, lambda, xrep; unsigned seed; int age; float fitness; int alive; } cell_t;
+static cell_t g_pop[POP_MAX]; static int g_pop_n = 0;
+static float  g_nextfit[POP_MAX];      /* this tick's fitness, computed in run_round, committed in pop_tick */
+static int    g_births = 0, g_deaths = 0;
+
+static float frand2(float a, float b) { return a + (b - a) * (float)((double)rand() / RAND_MAX); }
+static cell_t cell_birth(unsigned s) { cell_t c = { frand2(0.6f, 1.3f), 0.3f, 1.3f, s, 0, 0.6f, 1 }; return c; }
+static cell_t cell_mutate(cell_t p) {  /* offspring = parent angle ± jitter — mutate PERCEPTION, not weights */
+    cell_t c = p; c.age = 0; c.fitness = 0.6f; c.alive = 1;
+    c.temp   = fminf(1.4f, fmaxf(0.5f, p.temp   + frand2(-0.10f, 0.10f)));
+    c.lambda = fminf(0.6f, fmaxf(0.0f, p.lambda + frand2(-0.05f, 0.05f)));
+    c.xrep   = fminf(1.6f, fmaxf(1.0f, p.xrep   + frand2(-0.10f, 0.10f)));
+    c.seed   = p.seed ^ (unsigned)rand();
+    return c;
+}
+/* one tick of the laws: age++, novelty bonus, DEATH (<0.30), REPRODUCTION (>0.65 → mutated offspring), compact, RESURRECTION. */
+static void pop_tick(void) {
+    g_births = 0; g_deaths = 0;
+    for (int c = 0; c < g_pop_n; c++) if (g_pop[c].alive) {
+        g_pop[c].age++;
+        float f = (c < POP_MAX) ? g_nextfit[c] : 0.0f;
+        if (g_pop[c].age < 5) f += 0.05f * (5 - g_pop[c].age) / 5.0f;   /* novelty bonus (transformer_cell.py:130) */
+        f = f < 0 ? 0 : f > 1 ? 1 : f; g_pop[c].fitness = f;
+        if (f < F_DEATH) { g_pop[c].alive = 0; g_deaths++; }
+    }
+    int n = g_pop_n;
+    for (int c = 0; c < n && g_pop_n < POP_MAX; c++)
+        if (g_pop[c].alive && g_pop[c].fitness > F_REPRO) { g_pop[g_pop_n++] = cell_mutate(g_pop[c]); g_births++; }
+    int w = 0; for (int c = 0; c < g_pop_n; c++) if (g_pop[c].alive) g_pop[w++] = g_pop[c];   /* compact: drop the dead */
+    g_pop_n = w;
+    if (g_pop_n < POP_NMIN)   /* RESURRECTION — only at the edge of extinction; the field never stays dead */
+        while (g_pop_n < POP_NMIN + 1 && g_pop_n < POP_MAX)
+            { g_pop[g_pop_n] = cell_birth(42u + (unsigned)g_pop_n * 7919u + (unsigned)rand()); g_pop_n++; }
+}
+
 /* one round of the chorus over (prompt + prev_chorus). Each cell speaks from its temp-angle hearing the
  * voices already spoken THIS round (intra-round cascade) and, via prev_chorus, the whole prior round.
  * Accumulates every cell's emitted token-ids into `hist` (vocab counts → d_R), appends the round's text
@@ -856,8 +896,9 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
             } else snprintf(ctx, sizeof(ctx), "%s%s%s", prompt, prev_chorus ? prev_chorus : "", this_chorus);  /* CONVERGE: full */
         } else snprintf(ctx, sizeof(ctx), "%s%s%s", prompt, prev_chorus ? prev_chorus : "", this_chorus);
         int np = bpe_encode(tok, ctx, ids, max_seq - nfrag - 1);
-        float temp = 0.6f + 0.7f * (n_cells > 1 ? (float)c / (n_cells - 1) : 0.5f);
-        unsigned seed = seed_base + (unsigned)c * 7919u;
+        float temp = (g_life_on && c < POP_MAX) ? g_pop[c].temp : 0.6f + 0.7f * (n_cells > 1 ? (float)c / (n_cells - 1) : 0.5f);
+        unsigned seed = (g_life_on && c < POP_MAX) ? (g_pop[c].seed ^ ((unsigned)r * 2654435761u)) : seed_base + (unsigned)c * 7919u;  /* identity persists, utterance renews each tick */
+        if (g_life_on && c < POP_MAX) { g_xcell = g_pop[c].lambda; g_xrep = g_pop[c].xrep; }   /* per-cell perception (genome) */
         if (verbose) printf("\n  r%d cell %d (T=%.2f): ", r + 1, c, temp);
         cell_n = 0;
         g_nbr = prev_kv; g_nbr_len = prev_len;        /* cross-cell: this cell hears the prior cell's KV */
@@ -899,17 +940,20 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
             dsum += 1.0 - vec_cosine(cent + (size_t)a * m->embed, cent + (size_t)b * m->embed, m->embed); dn++;
         }
         *out_disso = dn ? (float)(dsum / dn) : 0.0f;
-        if (g_life_on && flog) {   /* δ-life INCREMENT 0: measure fitness inputs per cell, ACT ON NOTHING (calibration) */
+        if (g_life_on) {   /* δ-life: per-cell fitness = sqrt(theme_n · distinct_n) [calibrated] → g_nextfit, committed in pop_tick */
             float *F = (float*)calloc(m->embed, sizeof(float));
             for (int a = 0; a < n_cells; a++) { const float *ca = cent + (size_t)a*m->embed; for (int d = 0; d < m->embed; d++) F[d] += ca[d]; }
             if (n_cells) for (int d = 0; d < m->embed; d++) F[d] /= n_cells;
-            for (int a = 0; a < n_cells; a++) {
+            for (int a = 0; a < n_cells && a < POP_MAX; a++) {
                 const float *ca = cent + (size_t)a*m->embed;
                 double nrm = 0; for (int d = 0; d < m->embed; d++) nrm += (double)ca[d]*ca[d];
+                if (nrm < 1e-9) { g_nextfit[a] = 0.0f; continue; }   /* silence guard: a mute cell is unfit */
                 float theme = vec_cosine(ca, F, m->embed);
                 float nn = -1.0f; for (int b = 0; b < n_cells; b++) if (b != a) { float cc = vec_cosine(ca, cent + (size_t)b*m->embed, m->embed); if (cc > nn) nn = cc; }
-                fprintf(flog, "  δ-life cell %d: theme_cos=%.3f nn_cos=%.3f distinct=%.3f ent=%.2f silent=%d\n",
-                        a, theme, nn, nn < 0 ? 1.0f : 1.0f - nn, a < 8 ? g_cell_ent[a] : 0.0f, nrm < 1e-9 ? 1 : 0);
+                float tn = (theme - 0.50f) / 0.22f;       tn = tn < 0 ? 0 : tn > 1 ? 1 : tn;
+                float dn = ((1.0f - nn) - 0.60f) / 0.30f; dn = dn < 0 ? 0 : dn > 1 ? 1 : dn;
+                g_nextfit[a] = sqrtf(tn * dn);
+                if (flog) fprintf(flog, "  δ-life cell %d: theme=%.3f distinct=%.3f fit=%.3f\n", a, theme, 1.0f - nn, g_nextfit[a]);
             }
             free(F);
         }
@@ -985,6 +1029,37 @@ static void field_chorus(model_t *m, bpe_tokenizer *tok, const char *prompt, int
 static void shuffle_ids(int *ids, int from, int to, unsigned seed) {
     srand(seed);
     for (int i = to - 1; i > from; i--) { int j = from + rand() % (i - from + 1); int t = ids[i]; ids[i] = ids[j]; ids[j] = t; }
+}
+
+/* δ-life: the chorus as a LIVING, breathing population — cells born/die/reproduce by real-metric fitness
+ * over ticks (rounds = ticks; no daemon). Variable count each run; never extinct. Mutation = the angle. */
+static void field_life(model_t *m, bpe_tokenizer *tok, const char *prompt, int n_init, int n_ticks, int nfrag, int eos) {
+    if (n_ticks < 1) n_ticks = 1;
+    srand(12345);
+    g_pop_n = (n_init > 0 && n_init <= POP_MAX) ? n_init : 4;
+    for (int i = 0; i < g_pop_n; i++) g_pop[i] = cell_birth(42u + (unsigned)i * 7919u);
+    g_life_on = 1; g_chorus = 1;
+    FILE *flog = fopen("FIELDLOG.md", "a");
+    if (flog) { time_t now = time(NULL); fprintf(flog, "\n## %.24s — δ-life \"%s\" (%d ticks)\n", ctime(&now), prompt, n_ticks); }
+    printf("\n=== δ-life: Game of Life over ONE nanoArianna — \"%s\" (%d ticks, the population breathes) ===\n", prompt, n_ticks);
+    int vocab = m->vocab; int *hist = (int*)calloc(vocab, sizeof(int));
+    char this_chorus[4096];
+    for (int t = 0; t < n_ticks && g_pop_n > 0; t++) {
+        for (int i = 0; i < vocab; i++) hist[i] = 0;
+        float disso = 0;
+        printf("\n  --- tick %d/%d · pop %d ---", t + 1, n_ticks, g_pop_n);
+        if (flog) fprintf(flog, "\n**tick %d (pop %d):**\n", t + 1, g_pop_n);
+        float avg = run_round(m, tok, prompt, NULL, g_pop_n, nfrag, eos,
+                              42u + (unsigned)t * 131u, 1, t, hist, this_chorus, sizeof(this_chorus), NULL, flog, &disso);
+        pop_tick();
+        printf("\n  → tick %d: pop %d | births %d | deaths %d | D_R %.3f | avg_ent %.2f\n",
+               t + 1, g_pop_n, g_births, g_deaths, disso, avg);
+        if (flog) fprintf(flog, "→ tick %d: pop %d | births %d deaths %d | D_R %.3f | avg_ent %.2f\n",
+               t + 1, g_pop_n, g_births, g_deaths, disso, avg);
+    }
+    free(hist); g_life_on = 0;
+    if (flog) { fprintf(flog, "\n---\n"); fclose(flog); }
+    printf("\n=== δ-life done — the field breathed %d ticks, pop ended at %d ===\n", n_ticks, g_pop_n);
 }
 
 /* resonance-vs-length control. The claim "the per-round entropy fall = a resonant attractor" must be
@@ -1068,6 +1143,15 @@ int main(int argc, char **argv) {
         int nfrag    = argc > 5 ? atoi(argv[5]) : 12;
         int n_rounds = argc > 6 ? atoi(argv[6]) : 3;
         field_resonance_test(m, tok, prompt, n_cells, nfrag, n_rounds, eos);
+        return 0;
+    }
+
+    /* δ-life Game of Life:  ./arianna-q <gguf> <prompt> life [ticks] [nfrag] [init_cells] */
+    if (argc > 3 && strcmp(argv[3], "life") == 0) {
+        int ticks = argc > 4 ? atoi(argv[4]) : 8;
+        int nfrag = argc > 5 ? atoi(argv[5]) : 16;
+        int init  = argc > 6 ? atoi(argv[6]) : 4;
+        field_life(m, tok, prompt, init, ticks, nfrag, eos);
         return 0;
     }
 
