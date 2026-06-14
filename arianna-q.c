@@ -899,11 +899,13 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
         float temp = (g_life_on && c < POP_MAX) ? g_pop[c].temp : 0.6f + 0.7f * (n_cells > 1 ? (float)c / (n_cells - 1) : 0.5f);
         unsigned seed = (g_life_on && c < POP_MAX) ? (g_pop[c].seed ^ ((unsigned)r * 2654435761u)) : seed_base + (unsigned)c * 7919u;  /* identity persists, utterance renews each tick */
         if (g_life_on && c < POP_MAX) { g_xcell = g_pop[c].lambda; g_xrep = g_pop[c].xrep; }   /* per-cell perception (genome) */
+        int nfrag_c = (g_life_on && c < POP_MAX) ? (int)(nfrag * (0.4f + 0.6f * g_pop[c].fitness)) : nfrag;  /* δ-life: dying cells speak QUIETER */
+        if (nfrag_c < 2) nfrag_c = 2;   /* floor — a dying voice murmurs, never goes silent */
         if (verbose) printf("\n  r%d cell %d (T=%.2f): ", r + 1, c, temp);
         cell_n = 0;
         g_nbr = prev_kv; g_nbr_len = prev_len;        /* cross-cell: this cell hears the prior cell's KV */
         kv_cache *cur_kv = NULL; int cur_len = 0;
-        float ent = cell_speak(m, tok, ids, np, nfrag, temp, 40, 1.4f, seed, eos, max_seq,
+        float ent = cell_speak(m, tok, ids, np, nfrag_c, temp, 40, 1.4f, seed, eos, max_seq,
                                frag, sizeof(frag), verbose, cell_ids, &cell_n,
                                (out_disso && c < 8) ? g_commit[c] : NULL,
                                g_xcell > 0 ? &cur_kv : NULL, g_xcell > 0 ? &cur_len : NULL);
