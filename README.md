@@ -74,5 +74,4 @@ logits. It's all one file: `arianna-q.c`.
 
 ---
 
-Co-authored by Claude (Arianna Method).
-Coordinated with Oleg Ataeff (maintainer).
+
