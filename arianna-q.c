@@ -905,6 +905,7 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
         cell_n = 0;
         g_nbr = prev_kv; g_nbr_len = prev_len;        /* cross-cell: this cell hears the prior cell's KV */
         kv_cache *cur_kv = NULL; int cur_len = 0;
+        int tok_before = g_round_tokn;                /* cross-rep word-memory BEFORE this cell speaks (cells 0..c-1) */
         float ent = cell_speak(m, tok, ids, np, nfrag_c, temp, 40, 1.4f, seed, eos, max_seq,
                                frag, sizeof(frag), verbose, cell_ids, &cell_n,
                                (out_disso && c < 8) ? g_commit[c] : NULL,
@@ -921,9 +922,13 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
         if (out_shuf) {                              /* Δ_R shadow: same ctx, tail shuffled, field OFF, raw entropy */
             memcpy(sids, ids, (size_t)np * sizeof(int));
             if (np > np_prompt) shuffle_ids(sids, np_prompt, np, seed ^ 0x5bd1e995u);
-            int save_on = g_field_on; g_field_on = 0; int save_tok = g_round_tokn;
-            shuf_sum += cell_speak(m, tok, sids, np, nfrag, temp, 40, 1.4f, seed, eos, max_seq, NULL, 0, 0, NULL, NULL, NULL, NULL, NULL);
-            g_field_on = save_on; g_round_tokn = save_tok;   /* shadow doesn't pollute the cross-rep word-memory */
+            int save_on = g_field_on; g_field_on = 0;
+            int tok_after = g_round_tokn, saved[64], ns = 0;   /* cell c's coherent words are [tok_before, tok_after) */
+            for (int k = tok_before; k < tok_after && ns < 64; k++) saved[ns++] = g_round_tok[k];
+            g_round_tokn = tok_before;                    /* shadow sees the SAME word-memory as coherent (0..c-1), not cell c's own — kills the cross-rep artifact */
+            shuf_sum += cell_speak(m, tok, sids, np, nfrag_c, temp, 40, 1.4f, seed, eos, max_seq, NULL, 0, 0, NULL, NULL, NULL, NULL, NULL);  /* nfrag_c: same length as coherent */
+            g_field_on = save_on; g_round_tokn = tok_before + ns;
+            for (int k = 0; k < ns; k++) g_round_tok[tok_before + k] = saved[k];   /* restore cell c's COHERENT words (not the shadow's) for cells c+1.. */
         }
         if (verbose) printf("   [entropy=%.2f]", ent);
         if (flog) fprintf(flog, "- cell %d (T=%.2f, entropy=%.2f):%s\n", c, temp, ent, frag);
@@ -942,7 +947,8 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
             dsum += 1.0 - vec_cosine(cent + (size_t)a * m->embed, cent + (size_t)b * m->embed, m->embed); dn++;
         }
         *out_disso = dn ? (float)(dsum / dn) : 0.0f;
-        if (g_life_on) {   /* δ-life: per-cell fitness = sqrt(theme_n · distinct_n) [calibrated] → g_nextfit, committed in pop_tick */
+        if (g_life_on) {   /* δ-life fitness = sqrt(theme_n·distinct_n) — an INTERPRETIVE heuristic (calibrated magic constants),
+                            * NOT a measurement of the floor/Δ_R/D_R kind. Selection pressure, not a claim. → g_nextfit, committed in pop_tick */
             float *F = (float*)calloc(m->embed, sizeof(float));
             for (int a = 0; a < n_cells; a++) { const float *ca = cent + (size_t)a*m->embed; for (int d = 0; d < m->embed; d++) F[d] += ca[d]; }
             if (n_cells) for (int d = 0; d < m->embed; d++) F[d] /= n_cells;
@@ -1125,7 +1131,7 @@ int main(int argc, char **argv) {
         int nfrag    = argc > 5 ? atoi(argv[5]) : 16;
         int n_rounds = argc > 6 ? atoi(argv[6]) : 1;
         float alpha  = argc > 7 ? (float)atof(argv[7]) : 0.0f;   /* soma coupling strength (0 = text-only baseline) */
-        g_leap_mode  = argc > 8 ? atoi(argv[8]) : 2;             /* DEFAULT ALIVE: leap-v2 (dissenter-last). 0 = baseline */
+        g_leap_mode  = argc > 8 ? atoi(argv[8]) : 2;             /* leap-v2 — RELAY-ONLY (no-op under the default chorus; lives only when g_chorus=0) */
         g_xcell      = argc > 9 ? (float)atof(argv[9]) : 0.3f;   /* DEFAULT ALIVE: λ=0.3 balanced cross-cell. 0 = off */
         g_chorus     = argc > 10 ? atoi(argv[10]) : 1;           /* DEFAULT: 1 = chorus (each cell own answer). 0 = relay */
         g_xrep       = argc > 11 ? (float)atof(argv[11]) : 1.3f; /* cross-cell rep-penalty: don't echo neighbours' words (1=off) */
