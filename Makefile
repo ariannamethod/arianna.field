@@ -18,11 +18,15 @@ $(BIN): $(SRC)
 run: $(BIN)
 	./$(BIN) "$(MODEL)" "$(PROMPT)" 48 0.8
 
-# δ-field chorus: N cells x R rounds, coupled + meta-recursive (cells hear each other)
+# δ-field chorus: N cells, each its own answer, hearing each other's hidden K/V
 field: $(BIN)
-	./$(BIN) "$(MODEL)" "$(PROMPT)" field 4 12 3
+	./$(BIN) "$(MODEL)" "$(PROMPT)" field 4 16 1
+
+# δ-life: the chorus as a Game of Life — cells born/die/reproduce, the population breathes
+life: $(BIN)
+	./$(BIN) "$(MODEL)" "$(PROMPT)" life 12 18 5
 
 clean:
 	rm -f $(BIN)
 
-.PHONY: run field clean
+.PHONY: run field life clean
