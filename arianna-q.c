@@ -823,6 +823,55 @@ static float vec_cosine(const float *a, const float *b, int n) {
     return (na == 0 || nb == 0) ? 0.0f : (float)(dot / (sqrt(na) * sqrt(nb)));
 }
 
+/* ── qloop: the chorus answers its OWN questions (crazy-idea #1, ported+adapted from arianna2arianna) ──
+ * When a cell's fragment carries a literal '?', the most RESONANT other cells (not all — cap 1/2) answer it
+ * and the answer folds into the chorus text. Order-BLIND content-resonance (our cross-cell K is un-rope'd, so
+ * the route score is voice-meaning distance, not sequence). Default ON (g_qloop=2); --off → 0 = byte-identical
+ * debug anchor. Threshold g_qloop_min = measure-first (0.0 logs every route's score; Oleg signs the cutoff). */
+static int   g_qloop     = 2;       /* 0=off, 1=one resonant reply, 2=two. DEFAULT ON; --off sets 0 */
+static float g_qloop_min = 0.0f;    /* resonance acceptance cutoff — 0.0 = measure-first (accept+log all) */
+#define QLOOP_BUDGET    2           /* max replies per round/tick incl. hops (anti-runaway) */
+#define QLOOP_DEPTH_MAX 1           /* one recursive hop (answer-of-an-answer), then stop */
+
+/* trigger: a cell is "asking" iff its decoded fragment carries a literal '?'. (a2a TECHLOG: a logit-level
+ * detector is the future upgrade — do not enshrine '?' as the design.) */
+static int frag_question_count(const char *s) {
+    int n = 0; if (!s) return 0;
+    for (; *s; s++) if (*s == '?') n++;
+    return n;
+}
+/* score an asker→target route: voice-distance (rewards a DIFFERENT-sounding answerer) + asker-openness
+ * + target-decisiveness + multi-? bonus. Keeps the top max_routes by score, distinct targets. Returns count. */
+static int pick_question_routes(char frag[8][1024], const float *cent, int n_cells, int embed,
+                                const float *cell_ent, int *out_q, int *out_t, float *out_score, int max_routes) {
+    int lim = n_cells < 8 ? n_cells : 8, n = 0;
+    if (max_routes < 1) return 0;          /* B4: no routes requested → avoid out_score[-1] */
+    if (max_routes > 2) max_routes = 2;
+    for (int q = 0; q < lim; q++) {
+        int qmarks = frag_question_count(frag[q]);
+        if (qmarks <= 0) continue;
+        float qopen = cell_ent[q] / 8.0f; if (qopen > 1.0f) qopen = 1.0f;
+        for (int t = 0; t < lim; t++) if (t != q) {
+            float dist = 1.0f - vec_cosine(cent + (size_t)q * embed, cent + (size_t)t * embed, embed);
+            float confidence = 1.0f / (1.0f + cell_ent[t]);
+            float score = dist + 0.15f * qopen + 0.20f * confidence + 0.05f * (float)(qmarks - 1);
+            if (score < g_qloop_min) continue;
+            int dup = 0; for (int i = 0; i < n; i++) if (out_t[i] == t) { dup = 1; break; }   /* one reply per target */
+            if (dup) continue;
+            int idx;
+            if (n < max_routes) { idx = n; out_q[n] = q; out_t[n] = t; out_score[n] = score; n++; }
+            else if (score > out_score[max_routes - 1]) { idx = max_routes - 1; out_q[idx] = q; out_t[idx] = t; out_score[idx] = score; }
+            else continue;
+            for (int i = idx; i > 0 && out_score[i] > out_score[i - 1]; i--) {   /* keep sorted desc */
+                int aq = out_q[i], at = out_t[i]; float as = out_score[i];
+                out_q[i] = out_q[i - 1]; out_t[i] = out_t[i - 1]; out_score[i] = out_score[i - 1];
+                out_q[i - 1] = aq; out_t[i - 1] = at; out_score[i - 1] = as;
+            }
+        }
+    }
+    return n;
+}
+
 /* ── δ-life: the Game of Life over ANGLES (a cell is perception, the body is shared+fixed) ── */
 #define POP_MAX  8        /* hard cap = the instrument arrays g_commit[8] etc.; real-100 is a Phase-2 widening */
 #define F_DEATH  0.30f    /* config.py:12 DEATH_THRESHOLD */
@@ -942,13 +991,73 @@ static float run_round(model_t *m, bpe_tokenizer *tok, const char *prompt, const
         }
         if (verbose) printf("   [entropy=%.2f]", ent);
         if (flog) fprintf(flog, "- cell %d (T=%.2f, entropy=%.2f):%s\n", c, temp, ent, frag);
-        int add = snprintf(this_chorus + tc, sizeof(this_chorus) - tc, " %s", frag);
-        if (add > 0 && tc + add < (int)sizeof(this_chorus)) tc += add;
+        int crem = (int)sizeof(this_chorus) - tc;     /* B1: truncation-safe — advance tc by bytes ACTUALLY written */
+        if (crem > 1) { int add = snprintf(this_chorus + tc, (size_t)crem, " %s", frag); tc += (add > 0 && add < crem) ? add : crem - 1; }
         if (c < 8) { strncpy(cur_frag[c], frag, 1023); cur_frag[c][1023] = 0; }
         if (g_xcell > 0) { if (prev_kv) { free(prev_kv->k); free(prev_kv->v); free(prev_kv->ku); free(prev_kv); } prev_kv = cur_kv; prev_len = cur_len; }  /* chain c→c+1 */
     }
     if (prev_kv) { free(prev_kv->k); free(prev_kv->v); free(prev_kv->ku); free(prev_kv); }   /* free the last cell's kept kv */
     g_nbr = NULL; g_nbr_len = 0;
+    /* ── qloop: the chorus answers its own questions (crazy-idea #1). Cent + cur_frag + g_cell_ent are alive
+     * here (cent freed below at the out_disso block). Guard: never fires in floor probes (verbose=0/cent=NULL),
+     * so --off (g_qloop=0) and the default floor stay byte-identical. */
+    if (g_qloop && verbose && cent) {
+        int qcell[2], tcell[2]; float qscore[2];
+        int max_routes = g_qloop > 2 ? 2 : g_qloop;
+        int routes = pick_question_routes(cur_frag, cent, n_cells, m->embed, g_cell_ent, qcell, tcell, qscore, max_routes);
+        int qbudget = QLOOP_BUDGET;
+        int qfrag_n = nfrag / 2; if (qfrag_n < 2) qfrag_n = 2; if (qfrag_n > 8) qfrag_n = 8;
+        for (int rt = 0; rt < routes && qbudget > 0; rt++) {
+            int q = qcell[rt], t = tcell[rt];
+            char qctx[8704]; snprintf(qctx, sizeof(qctx), "%s %s", prompt, cur_frag[q]);   /* the TARGET answers the quoted question */
+            int qnp = bpe_encode(tok, qctx, ids, max_seq - qfrag_n - 1);
+            float qtemp = (g_life_on && t < POP_MAX) ? g_pop[t].temp : 0.6f + 0.7f * (n_cells > 1 ? (float)t / (n_cells - 1) : 0.5f);
+            unsigned qseed = seed_base ^ ((unsigned)t * 7919u) ^ 0x9e3779b9u;
+            char qfrag[1024]; int qids[256], qcn = 0;
+            int save_tokn = g_round_tokn;                 /* qloop reply must NOT poison the round's cross-rep word-memory */
+            int save_fon = g_field_on; g_field_on = 0;    /* B2: nor the soma EMA (g_field_dir) — qloop is a meta-reply */
+            g_nbr = NULL; g_nbr_len = 0;                  /* the reply attends no stale neighbour */
+            if (verbose) printf("\n  ↳ qloop c%d→c%d score %.3f: ", q, t, qscore[rt]);
+            cell_speak(m, tok, ids, qnp, qfrag_n, qtemp, 40, 1.4f, qseed, eos, max_seq,
+                       qfrag, sizeof(qfrag), verbose, qids, &qcn, NULL, NULL, NULL);
+            g_round_tokn = save_tokn; g_field_on = save_fon;
+            int qrem = (int)sizeof(this_chorus) - tc;     /* B1: advance tc by bytes ACTUALLY written (truncation-safe) */
+            if (qrem > 1) { int qadd = snprintf(this_chorus + tc, (size_t)qrem, " %s", qfrag); tc += (qadd > 0 && qadd < qrem) ? qadd : qrem - 1; }
+            for (int i = 0; i < qcn; i++) if (qids[i] >= 0 && qids[i] < m->vocab) hist[qids[i]]++;
+            if (flog) fprintf(flog, "  ↳ qloop c%d→c%d score %.3f:%s\n", q, t, qscore[rt], qfrag);
+            qbudget--;
+            /* one recursive hop (depth cap): if the answer itself asks, recruit a 3rd resonant cell at a higher gate */
+            if (QLOOP_DEPTH_MAX >= 1 && qbudget > 0 && qcn > 0 && frag_question_count(qfrag) > 0) {
+                float *acent = (float*)calloc(m->embed, sizeof(float));
+                if (!acent) break;                            /* B3: OOM — skip the hop, stop qloop */
+                for (int i = 0; i < qcn; i++) { const float *e = m->tok_emb + (long)qids[i] * m->embed; for (int d = 0; d < m->embed; d++) acent[d] += e[d]; }
+                for (int d = 0; d < m->embed; d++) acent[d] /= qcn;
+                int best = -1; float bestsc = g_qloop_min + 0.10f;   /* higher gate for the hop */
+                for (int t3 = 0; t3 < n_cells && t3 < 8; t3++) if (t3 != t && t3 != q) {
+                    float sc = (1.0f - vec_cosine(acent, cent + (size_t)t3 * m->embed, m->embed)) + 0.20f / (1.0f + g_cell_ent[t3]);
+                    if (sc > bestsc) { bestsc = sc; best = t3; }
+                }
+                if (best >= 0) {
+                    char hctx[8704]; snprintf(hctx, sizeof(hctx), "%s %s", prompt, qfrag);
+                    int hnp = bpe_encode(tok, hctx, ids, max_seq - qfrag_n - 1);
+                    float htemp = (g_life_on && best < POP_MAX) ? g_pop[best].temp : 0.6f + 0.7f * (n_cells > 1 ? (float)best / (n_cells - 1) : 0.5f);
+                    unsigned hseed = seed_base ^ ((unsigned)best * 40503u) ^ 0x85ebca6bu;
+                    char hfrag[1024];
+                    int save2 = g_round_tokn, sfon2 = g_field_on; g_field_on = 0; g_nbr = NULL; g_nbr_len = 0;
+                    if (verbose) printf("\n    ↳↳ qloop c%d→c%d score %.3f: ", t, best, bestsc);
+                    cell_speak(m, tok, ids, hnp, qfrag_n, htemp, 40, 1.4f, hseed, eos, max_seq,
+                               hfrag, sizeof(hfrag), verbose, NULL, NULL, NULL, NULL, NULL);
+                    g_round_tokn = save2; g_field_on = sfon2;
+                    int hrem = (int)sizeof(this_chorus) - tc;
+                    if (hrem > 1) { int hadd = snprintf(this_chorus + tc, (size_t)hrem, " %s", hfrag); tc += (hadd > 0 && hadd < hrem) ? hadd : hrem - 1; }
+                    if (flog) fprintf(flog, "    ↳↳ qloop c%d→c%d score %.3f:%s\n", t, best, bestsc, hfrag);
+                    qbudget--;
+                }
+                free(acent);
+            }
+        }
+        g_nbr = NULL; g_nbr_len = 0;
+    }
     if (out_chorus) { strncpy(out_chorus, this_chorus, (size_t)out_cap - 1); out_chorus[out_cap - 1] = 0; }
     if (out_shuf) *out_shuf = shuf_sum / n_cells;
     if (out_disso) {                              /* D_R = 1 − mean pairwise cosine of cell fragment centroids (voice-disagreement) */
@@ -1127,6 +1236,9 @@ int main(int argc, char **argv) {
     int max_tokens = argc > 3 ? atoi(argv[3]) : 48;
     float temp = argc > 4 ? (float)atof(argv[4]) : 0.8f;
     srand(42);
+    /* qloop (idea #1) ships ON by default; hidden --off kill-switch glues it shut for debug → byte-identical
+     * to the pre-qloop chorus. Stderr note keeps stdout byte-identical for the anchor diff. */
+    for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--off") == 0) { g_qloop = 0; fprintf(stderr, "[qloop OFF — debug anchor]\n"); }
 
     double t0 = now_ms();
     gguf_file *gf = gguf_open(argv[1]); if (!gf) return 1;
